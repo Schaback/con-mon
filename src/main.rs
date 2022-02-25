@@ -5,6 +5,7 @@ use std::{process::Stdio, str::FromStr, time::Duration};
 
 use log::info;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::oneshot::channel;
 use tokio::{process::Command, time};
 
 use anyhow::anyhow;
@@ -68,15 +69,16 @@ async fn pinger() -> Result<()> {
     let stdout = handle.stdout.take().unwrap();
     let reader = BufReader::new(stdout);
 
+    let (send, recv) = channel::<()>();
     // Ensure the child process is spawned in the runtime so it can
     // make progress on its own while we await for any output.
     tokio::spawn(async move {
-        let status = handle
-            .wait()
-            .await
-            .expect("child process encountered an error");
-
-        debug!("child status was: {}", status);
+        tokio::select! {
+            status = handle.wait() => {
+                debug!("child status was: {}", status.expect("no status"));
+            },
+            _ = recv => handle.kill().await.expect("Kill failed"),
+        }
     });
 
     let mut outfile = File::options().append(true).create(true).open("ping.log")?;
@@ -84,23 +86,32 @@ async fn pinger() -> Result<()> {
     let mut lines = reader.lines();
     loop {
         let line = time::timeout(Duration::from_secs(PING_TIMEOUT), lines.next_line());
-        if let Ok(line) = line.await {
-            // Timeout check passed
-            let line = line?.ok_or(anyhow!("Missing content?"))?;
-            debug!("Line: {}", line);
-            match line.parse::<Ping>() {
-                Ok(ping) => {
-                    outfile.write_all(format!("{}\n", ping).as_bytes())?;
-                    outfile.flush()?;
+        match line.await {
+            Ok(Ok(Some(line))) => {
+                // Timeout check passed
+                debug!("Line: {}", line);
+                match line.parse::<Ping>() {
+                    Ok(ping) => {
+                        outfile.write_all(format!("{}\n", ping).as_bytes())?;
+                        outfile.flush()?;
+                    }
+                    Err(err) => warn!("Couldn't parse: {}", err),
                 }
-                Err(err) => warn!("Couldn't parse: {}", err),
             }
-        } else {
-            info!("Ping took longer than {} seconds.", PING_TIMEOUT);
-            info!("Restarting pinger");
-            break;
+            Ok(Ok(None)) => {
+                println!("Task gave no more lines");
+                break;
+            }
+            _ => {
+                info!("Ping took longer than {} seconds.", PING_TIMEOUT);
+                info!("Restarting pinger");
+                break;
+            }
         }
     }
+
+    // Kill the ping process
+    send.send(()).unwrap();
     Ok(())
 }
 
