@@ -1,5 +1,5 @@
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::{process::Stdio, str::FromStr, time::Duration};
 
@@ -13,7 +13,7 @@ use anyhow::Error;
 use anyhow::Result;
 
 use log::{debug, warn, LevelFilter};
-use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
+use simplelog::{ColorChoice, CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
 
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -117,12 +117,22 @@ async fn pinger() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    TermLogger::init(
-        LevelFilter::Info,
-        Config::default(),
-        TerminalMode::Mixed,
-        ColorChoice::Auto,
-    )?;
+    CombinedLogger::init(vec![
+        TermLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ),
+        WriteLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open("con_mon.log")?,
+        ),
+    ])?;
 
     loop {
         pinger().await?;
