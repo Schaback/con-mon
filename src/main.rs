@@ -4,15 +4,17 @@ use std::io::Write;
 use std::{process::Stdio, str::FromStr, time::Duration};
 
 use log::info;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::oneshot::channel;
+use tokio::time::interval;
 use tokio::{process::Command, time};
 
 use anyhow::anyhow;
 use anyhow::Error;
 use anyhow::Result;
 
-use log::{debug, warn, LevelFilter};
+use log::{debug, error, warn, LevelFilter};
 use simplelog::{ColorChoice, CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
 
 use lazy_static::lazy_static;
@@ -20,6 +22,9 @@ use regex::Regex;
 
 /// Maximum time to wait for ping before restarting
 const PING_TIMEOUT: u64 = 10;
+
+/// Speedtest interval in seconds
+const SPEEDTEST_INTERVAL: u64 = 30 * 60;
 
 #[derive(Debug)]
 struct Ping {
@@ -89,7 +94,7 @@ async fn pinger() -> Result<()> {
         match line.await {
             Ok(Ok(Some(line))) => {
                 // Timeout check passed
-                debug!("Line: {}", line);
+                debug!("Ping: {}", line);
                 match line.parse::<Ping>() {
                     Ok(ping) => {
                         outfile.write_all(format!("{}\n", ping).as_bytes())?;
@@ -99,7 +104,7 @@ async fn pinger() -> Result<()> {
                 }
             }
             Ok(Ok(None)) => {
-                println!("Task gave no more lines");
+                error!("Task gave no more lines");
                 break;
             }
             _ => {
@@ -112,6 +117,39 @@ async fn pinger() -> Result<()> {
 
     // Kill the ping process
     send.send(()).unwrap();
+    Ok(())
+}
+
+async fn speed_tester() -> Result<()> {
+    debug!("Speedtest started");
+    let output = Command::new("speedtest-cli").arg("--json").output().await?;
+    if !output.status.success() {
+        error!("Speedtest failed: {:?}", output.stderr);
+        return Ok(());
+    }
+    let output = String::from_utf8(output.stdout)?;
+    debug!("Speed: {}", &output);
+    let output_json = serde_json::from_str(&output)?;
+
+    let all_tests_file = File::options()
+        .append(true)
+        .create(true)
+        .read(true)
+        .open("speedtests.json")?;
+
+    let all_tests = match serde_json::from_reader::<_, Value>(&all_tests_file) {
+        Ok(mut array) => {
+            let x = array
+                .as_array_mut()
+                .ok_or(anyhow!("Speedtest file has wrong format, delete it"))?;
+            x.push(output_json);
+            json!(x)
+        }
+        Err(_) => json!(vec![output_json]),
+    };
+
+    serde_json::to_writer(all_tests_file, &all_tests)?;
+
     Ok(())
 }
 
@@ -133,6 +171,17 @@ async fn main() -> Result<()> {
                 .open("con_mon.log")?,
         ),
     ])?;
+
+    async fn tester() -> Result<()> {
+        let mut iv = interval(Duration::from_secs(SPEEDTEST_INTERVAL));
+
+        loop {
+            iv.tick().await;
+            speed_tester().await?;
+        }
+    }
+
+    tokio::spawn(tester());
 
     loop {
         pinger().await?;
